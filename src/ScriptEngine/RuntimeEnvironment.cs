@@ -5,6 +5,7 @@ was not distributed with this file, You can obtain one
 at http://mozilla.org/MPL/2.0/.
 ----------------------------------------------------------*/
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using OneScript.Commons;
 using OneScript.Compilation;
@@ -25,7 +26,10 @@ namespace ScriptEngine
         
         private readonly PropertyBag _injectedProperties;
 
-        private readonly List<IAttachableContext> _contexts = new List<IAttachableContext>();
+        // Глобальные области читают компиляторы и машины других потоков, пока подключается
+        // компонента или загружается библиотека. Поэтому им отдаются копии, которые заменяются целиком
+        private volatile SymbolTable _publishedSymbols = new SymbolTable();
+        private volatile IAttachableContext[] _contexts = Array.Empty<IAttachableContext>();
 
         private readonly ILibraryManager _libraryManager;
 
@@ -33,6 +37,7 @@ namespace ScriptEngine
         {
             _injectedProperties = new PropertyBag();
             _libraryManager = new LibraryManager(_injectedProperties);
+            AttachedContexts = new AttachedContextsView(this);
         }
 
         private void CreateGlobalScopeIfNeeded()
@@ -42,9 +47,31 @@ namespace ScriptEngine
             
             lock (_injectedProperties)
             {
-                _scopeOfGlobalProperties ??= _symbols.PushContext(_injectedProperties);
-                _contexts.Add(_injectedProperties);
+                if (_scopeOfGlobalProperties != null)
+                    return;
+
+                // Сюда добавляются модули библиотек, пока другие потоки компилируют сценарии
+                var scope = new SymbolScope(concurrentReads: true);
+                _symbols.PushScope(scope, ScopeBindingDescriptor.Static(_injectedProperties));
+                PublishScopes(_injectedProperties);
+                _scopeOfGlobalProperties = scope;
             }
+        }
+
+        // Вызывается под блокировкой, после того как область добавлена в _symbols
+        private void PublishScopes(IAttachableContext addedContext)
+        {
+            var contexts = new IAttachableContext[_contexts.Length + 1];
+            _contexts.CopyTo(contexts, 0);
+            contexts[^1] = addedContext;
+            _contexts = contexts;
+
+            var table = new SymbolTable();
+            for (int i = 0; i < _symbols.ScopeCount; i++)
+            {
+                table.PushScope(_symbols.GetScope(i), _symbols.GetBinding(i));
+            }
+            _publishedSymbols = table;
         }
 
         public void InjectObject(IAttachableContext context)
@@ -125,13 +152,16 @@ namespace ScriptEngine
 
         private void RegisterObject(IAttachableContext context)
         {
-            _symbols.PushContext(context);
-            _contexts.Add(context);
+            lock (_injectedProperties)
+            {
+                _symbols.PushContext(context);
+                PublishScopes(context);
+            }
         }
         
         public void SetGlobalProperty(string propertyName, IValue value)
         {
-            _symbols.FindVariable(propertyName, out var binding);
+            _publishedSymbols.FindVariable(propertyName, out var binding);
 
             var context = _contexts[binding.ScopeNumber];
             context.SetPropValue(binding.MemberNumber, value);
@@ -139,19 +169,42 @@ namespace ScriptEngine
 
         public IValue GetGlobalProperty(string propertyName)
         {
-            _symbols.FindVariable(propertyName, out var binding);
+            _publishedSymbols.FindVariable(propertyName, out var binding);
 
             var context = _contexts[binding.ScopeNumber];
             return context.GetPropValue(binding.MemberNumber);
         }
 
-        public SymbolTable GetSymbolTable() => _symbols;
+        public SymbolTable GetSymbolTable() => _publishedSymbols;
 
-        public IReadOnlyList<IAttachableContext> AttachedContexts => _contexts;
+        public IReadOnlyList<IAttachableContext> AttachedContexts { get; }
 
         public void InitExternalLibrary(ScriptingEngine runtime, ExternalLibraryInfo library, IBslProcess process)
         {
             _libraryManager.InitExternalLibrary(runtime, library, process);
+        }
+
+        /// <summary>
+        /// Текущий список глобальных контекстов: кадры выполнения держат его и видят контексты,
+        /// подключенные после их создания
+        /// </summary>
+        private sealed class AttachedContextsView : IReadOnlyList<IAttachableContext>
+        {
+            private readonly RuntimeEnvironment _owner;
+
+            public AttachedContextsView(RuntimeEnvironment owner)
+            {
+                _owner = owner;
+            }
+
+            public int Count => _owner._contexts.Length;
+
+            // Массив только растет, поэтому номер, полученный по прежнему Count, остается верным
+            public IAttachableContext this[int index] => _owner._contexts[index];
+
+            public IEnumerator<IAttachableContext> GetEnumerator() => ((IEnumerable<IAttachableContext>)_owner._contexts).GetEnumerator();
+
+            IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
         }
 
         private class WrappedPropertySymbol : IPropertySymbol

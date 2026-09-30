@@ -16,7 +16,17 @@ namespace OneScript.Compilation.Binding
     public class SymbolsCollection<T> : IReadOnlyList<T>
         where T : ISymbol
     {
-        private readonly IndexedNameValueCollection<T> _storage = new IndexedNameValueCollection<T>();
+        private readonly IndexedNameValueCollection<T> _storage;
+
+        public SymbolsCollection() : this(false)
+        {
+        }
+
+        /// <param name="concurrentReads">Искать символы можно из других потоков, пока их добавляют</param>
+        public SymbolsCollection(bool concurrentReads)
+        {
+            _storage = new IndexedNameValueCollection<T>(concurrentReads);
+        }
 
         public int Add(T symbol)
         {
