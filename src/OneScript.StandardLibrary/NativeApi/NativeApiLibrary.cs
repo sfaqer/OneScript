@@ -25,7 +25,8 @@ namespace OneScript.StandardLibrary.NativeApi
     {
         private delegate IntPtr GetClassNames();
 
-        private readonly List<NativeApiComponent> _components = new List<NativeApiComponent>();
+        private readonly HashSet<NativeApiComponent> _components =
+            new HashSet<NativeApiComponent>(ReferenceEqualityComparer.Instance);
 
         private readonly string _identifier;
         private readonly String _tempfile;
@@ -36,6 +37,10 @@ namespace OneScript.StandardLibrary.NativeApi
             new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private readonly List<string> _knownExtensionNames = new List<string>();
         private bool _allKeysEnumerated;
+
+        // Компоненты одной библиотеки создают из разных фоновых заданий и запросов веб-сервера,
+        // а кэш имен и список созданных компонент у библиотеки общие
+        private readonly object _lock = new object();
 
         public NativeApiLibrary(string filepath, string identifier, ITypeManager typeManager)
         {
@@ -110,6 +115,14 @@ namespace OneScript.StandardLibrary.NativeApi
         {
             var typeDef = typeManager.GetTypeByName(typeName);
 
+            lock (_lock)
+            {
+                return DoCreateComponent(host, typeDef, componentName);
+            }
+        }
+
+        private IValue DoCreateComponent(object host, TypeDescriptor typeDef, String componentName)
+        {
             if (_extensionToClassName.TryGetValue(componentName, out var cachedClassName))
                 return TrackComponent(CreateComponentByClassName(host, typeDef, cachedClassName, componentName));
 
@@ -197,6 +210,17 @@ namespace OneScript.StandardLibrary.NativeApi
             return component;
         }
 
+        /// <summary>
+        /// Компонента освобождена (ОсвободитьОбъект): при выгрузке библиотеки ее уничтожать уже не нужно
+        /// </summary>
+        internal void UntrackComponent(NativeApiComponent component)
+        {
+            lock (_lock)
+            {
+                _components.Remove(component);
+            }
+        }
+
         private RuntimeException CreateNotFoundException(string componentName)
         {
             var message = new StringBuilder();
@@ -214,11 +238,18 @@ namespace OneScript.StandardLibrary.NativeApi
 
         public void Dispose()
         {
-            foreach (var component in _components)
+            NativeApiComponent[] components;
+            lock (_lock)
+            {
+                components = _components.ToArray();
+                _components.Clear();
+            }
+
+            // Не под перебором списка: освобождаемая компонента сама снимает себя с учета
+            foreach (var component in components)
             {
                 component.Dispose();
             }
-            _components.Clear();
 
             if (Loaded && NativeApiKernel.FreeLibrary(Module))
             {
