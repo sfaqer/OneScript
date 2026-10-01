@@ -44,3 +44,5 @@ jobs:
           files: artifacts/*tests/*.xml
           check_name: Test results
           comment_title: Результаты тестов
+          # Только упавшие тесты, без списков всех и пропущенных
+          check_run_annotations: none
