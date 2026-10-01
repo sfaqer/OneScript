@@ -1,0 +1,173 @@
+# Анализ SonarQube для PR из форков. В QA у таких PR нет секретов, поэтому там только сборка
+# с анализаторами, а здесь результаты отправляются на сервер. Код форка здесь не собирается и не запускается.
+
+name: QA (fork)
+
+on:
+  workflow_run:
+    workflows: [QA]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  sonar:
+    name: SonarQube
+    runs-on: windows-latest
+    if: >
+      github.repository == 'sfaqer/OneScript' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion == 'success'
+    permissions:
+      actions: read
+      pull-requests: read
+    env:
+      HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+      HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+      HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+    steps:
+      # Сканер ставится до checkout, чтобы dotnet не прочитал NuGet.config из кода форка
+      - name: Install SonarQube scanner
+        shell: pwsh
+        run: dotnet tool install dotnet-sonarscanner --tool-path "$env:RUNNER_TEMP\scanner"
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: sonar-analysis
+          path: ${{ runner.temp }}/sonar-analysis
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+
+      # Артефакт собран кодом форка, поэтому номер PR из него сверяем с GitHub: PR открыт и собран
+      # из этого же коммита форка. Базовую ветку берем у GitHub
+      - name: Find pull request
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          if ($env:HEAD_BRANCH -notmatch '^[\w./+-]+$') { throw "Неподдерживаемое имя ветки: $env:HEAD_BRANCH" }
+          $number = (Get-Content -Raw "$env:RUNNER_TEMP\sonar-analysis\pr-number.txt").Trim()
+          if ($number -notmatch '^\d+$') { throw "Неверный номер PR: $number" }
+          $pr = gh api "repos/$env:GITHUB_REPOSITORY/pulls/$number" | ConvertFrom-Json
+          if ($pr.state -ne 'open' -or $pr.head.sha -ne $env:HEAD_SHA -or $pr.head.repo.full_name -ne $env:HEAD_REPO) {
+              throw "PR #$number не собран из $($env:HEAD_REPO) на $env:HEAD_SHA"
+          }
+          "number=$number" >> $env:GITHUB_OUTPUT
+          "base=$($pr.base.ref)" >> $env:GITHUB_OUTPUT
+
+      # Исходники нужны сканеру для отчета, ничего из них не запускается, поэтому код форка здесь разрешен
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.HEAD_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+          allow-unsafe-pr-checkout: true
+
+      # ТЕСТ: свой SonarQube Community на раннере с профилем C# проекта с sonar.openbsl.ru
+      - name: Start local SonarQube
+        shell: pwsh
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $ver = '26.2.0.119303'
+          Invoke-WebRequest "https://binaries.sonarsource.com/Distribution/sonarqube/sonarqube-$ver.zip" -OutFile "$env:RUNNER_TEMP\sq.zip"
+          7z x "$env:RUNNER_TEMP\sq.zip" "-o$env:RUNNER_TEMP" -bso0 -bsp0
+          $env:SONAR_JAVA_PATH = "$env:JAVA_HOME_21_X64\bin\java.exe"
+          Start-Process -FilePath "$env:RUNNER_TEMP\sonarqube-$ver\bin\windows-x86-64\StartSonar.bat" -WindowStyle Hidden
+          $base = 'http://localhost:9000'
+          for ($i = 0; $i -lt 120; $i++) {
+              try { $st = (Invoke-RestMethod "$base/api/system/status").status } catch { $st = 'DOWN' }
+              if ($st -eq 'UP') { break }
+              Start-Sleep 5
+          }
+          if ($st -ne 'UP') { Get-ChildItem "$env:RUNNER_TEMP\sonarqube-$ver\logs" | ForEach-Object { $_.Name; Get-Content $_.FullName -Tail 40 }; throw "SonarQube: $st" }
+          $pw = 'Aa1!' + [guid]::NewGuid()
+          $basic = { param($p) @{ Authorization = 'Basic ' + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("admin:$p")) } }
+          Invoke-RestMethod -Method Post "$base/api/users/change_password" -Headers (& $basic 'admin') -Body @{ login = 'admin'; previousPassword = 'admin'; password = $pw } | Out-Null
+          $auth = & $basic $pw
+          Invoke-WebRequest 'https://sonar.openbsl.ru/api/qualityprofiles/backup?language=cs&qualityProfile=OneScript%20Profile' -OutFile "$env:RUNNER_TEMP\profile.xml"
+          Invoke-RestMethod -Method Post "$base/api/qualityprofiles/restore" -Headers $auth -Form @{ backup = Get-Item "$env:RUNNER_TEMP\profile.xml" } | ConvertTo-Json -Depth 3
+          Invoke-RestMethod -Method Post "$base/api/qualityprofiles/set_default" -Headers $auth -Body @{ language = 'cs'; qualityProfile = 'OneScript Profile' } | Out-Null
+          $token = (Invoke-RestMethod -Method Post "$base/api/user_tokens/generate" -Headers $auth -Body @{ name = 'ci' }).token
+          "::add-mask::$token"
+          "LOCAL_SONAR_TOKEN=$token" >> $env:GITHUB_ENV
+
+      - name: Prepare analysis
+        env:
+          SONAR_TOKEN: ${{ env.LOCAL_SONAR_TOKEN }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          PR_BASE: ${{ steps.pr.outputs.base }}
+        shell: pwsh
+        run: |
+          # ТЕСТ: в Community нет анализа PR, параметры только печатаем
+          "PR $env:PR_NUMBER, $env:HEAD_BRANCH -> $env:PR_BASE, $env:HEAD_SHA"
+          & "$env:RUNNER_TEMP\scanner\dotnet-sonarscanner" begin /k:OneScript /d:sonar.cs.vscoveragexml.reportsPaths=coverage.xml `
+              "/d:sonar.scm.revision=$env:HEAD_SHA" "/d:sonar.token=$env:SONAR_TOKEN" /d:sonar.host.url=http://localhost:9000
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      # Конфигурацию анализа создал begin выше, из артефакта берем только результаты анализаторов,
+      # списки файлов проектов и покрытие. Их пишет сборка форка, поэтому все пути должны вести внутрь
+      # рабочего каталога, а списки файлов — лежать в .sonarqube, который begin только что очистил.
+      - name: Restore analysis results
+        shell: pwsh
+        run: |
+          $src = Join-Path $env:RUNNER_TEMP 'sonar-analysis'
+          $root = $env:GITHUB_WORKSPACE.TrimEnd('\') + '\'
+          function Assert-Under($dir, $paths) {
+              $bad = $paths | Where-Object { $_ } | Where-Object {
+                  $_ -match '(^|[\\/])\.\.([\\/]|$)' -or
+                  -not [IO.Path]::GetFullPath($_).StartsWith($dir, [StringComparison]::OrdinalIgnoreCase)
+              }
+              if ($bad) { throw "Пути вне $($dir):`n$($bad -join "`n")" }
+          }
+          foreach ($info in Get-ChildItem "$src\.sonarqube\out" -Recurse -Filter ProjectInfo.xml) {
+              $project = ([xml](Get-Content -Raw $info.FullName)).ProjectInfo
+              $files = @($project.AnalysisResultFiles.AnalysisResultFile | Where-Object { $_ })
+              Assert-Under $root $project.FullPath
+              # Списки путей сканер делит и запятой, и чертой
+              Assert-Under $root ($project.AnalysisSettings.Property | ForEach-Object { $_.InnerText -split '[,;|\r\n]' } | Where-Object { $_ -match '[\\/]' })
+              Assert-Under "$root.sonarqube\" $files.Location
+              foreach ($list in $files) {
+                  Assert-Under $root (Get-Content (Join-Path $src $list.Location.Substring($root.Length)))
+              }
+          }
+          if (git ls-files -s | Select-String '^120000') { throw 'В PR есть символические ссылки' }
+          Copy-Item "$src\.sonarqube\out" "$root.sonarqube" -Recurse -Force
+          foreach ($list in Get-ChildItem "$src\.sonarqube\conf\*\FilesToAnalyze.txt") {
+              $dir = New-Item -ItemType Directory -Force "$root.sonarqube\conf\$($list.Directory.Name)"
+              Copy-Item $list.FullName $dir
+          }
+          Copy-Item "$src\coverage.xml" $root
+
+      - name: Analyze
+        env:
+          SONAR_TOKEN: ${{ env.LOCAL_SONAR_TOKEN }}
+        shell: pwsh
+        run: |
+          & "$env:RUNNER_TEMP\scanner\dotnet-sonarscanner" end "/d:sonar.token=$env:SONAR_TOKEN"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      # ТЕСТ: сравнить результат с анализом develop на sonar.openbsl.ru
+      - name: Compare with sonar.openbsl.ru
+        shell: pwsh
+        run: |
+          $base = 'http://localhost:9000'
+          $auth = @{ Authorization = 'Bearer ' + $env:LOCAL_SONAR_TOKEN }
+          $task = (Get-Content "$env:GITHUB_WORKSPACE\.sonarqube\out\.sonar\report-task.txt" | Where-Object { $_ -like 'ceTaskId=*' }).Substring(9)
+          for ($i = 0; $i -lt 120; $i++) {
+              $st = (Invoke-RestMethod "$base/api/ce/task?id=$task" -Headers $auth).task.status
+              if ($st -notin 'PENDING', 'IN_PROGRESS') { break }
+              Start-Sleep 5
+          }
+          "CE task: $st"
+          $metrics = 'ncloc,files,coverage,lines_to_cover,uncovered_lines,violations,bugs,code_smells,vulnerabilities'
+          $local = (Invoke-RestMethod "$base/api/measures/component?component=OneScript&metricKeys=$metrics" -Headers $auth).component.measures
+          $remote = (Invoke-RestMethod "https://sonar.openbsl.ru/api/measures/component?component=OneScript&branch=develop&metricKeys=$metrics").component.measures
+          foreach ($m in $metrics -split ',') { '{0,-16} local={1,-10} openbsl/develop={2}' -f $m, ($local | Where-Object metric -eq $m).value, ($remote | Where-Object metric -eq $m).value }
+          $q = 'componentKeys=OneScript&languages=cs&scopes=MAIN&resolved=false&ps=1&facets=rules'
+          $li = Invoke-RestMethod "$base/api/issues/search?$q" -Headers $auth
+          $ri = Invoke-RestMethod "https://sonar.openbsl.ru/api/issues/search?$q&branch=develop"
+          "C# issues (main code, open): local=$($li.total) openbsl/develop=$($ri.total)"
+          $lr = @{}; foreach ($v in $li.facets[0].values) { $lr[$v.val] = $v.count }
+          $rr = @{}; foreach ($v in $ri.facets[0].values) { $rr[$v.val] = $v.count }
+          foreach ($k in ($lr.Keys + $rr.Keys | Sort-Object -Unique)) { if ($lr[$k] -ne $rr[$k]) { '  {0,-20} local={1} openbsl={2}' -f $k, $lr[$k], $rr[$k] } }
