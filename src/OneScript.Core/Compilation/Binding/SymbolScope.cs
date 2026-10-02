@@ -15,11 +15,23 @@ namespace OneScript.Compilation.Binding
 {
     public class SymbolScope
     {
-        public SymbolsCollection<IMethodSymbol> Methods { get; } =
-            new SymbolsCollection<IMethodSymbol>();
+        public SymbolScope() : this(false)
+        {
+        }
 
-        public SymbolsCollection<IVariableSymbol> Variables { get; } =
-            new SymbolsCollection<IVariableSymbol>();
+        /// <param name="concurrentReads">
+        /// Область общая для нескольких потоков: в ней ищут символы, пока в нее добавляют новые
+        /// (например, глобальные свойства, куда пишут модули загружаемых библиотек)
+        /// </param>
+        public SymbolScope(bool concurrentReads)
+        {
+            Methods = new SymbolsCollection<IMethodSymbol>(concurrentReads);
+            Variables = new SymbolsCollection<IVariableSymbol>(concurrentReads);
+        }
+
+        public SymbolsCollection<IMethodSymbol> Methods { get; }
+
+        public SymbolsCollection<IVariableSymbol> Variables { get; }
 
 
         public int DefineVariable(IVariableSymbol symbol)

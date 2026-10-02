@@ -7,6 +7,7 @@ at http://mozilla.org/MPL/2.0/.
 
 using System;
 using System.Collections;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 
@@ -18,8 +19,24 @@ namespace OneScript.Commons
     /// <typeparam name="T"></typeparam>
     public class IndexedNameValueCollection<T> : IEnumerable<T>
     {
-        private readonly Dictionary<string, int> _nameIndex = new Dictionary<string, int>(StringComparer.InvariantCultureIgnoreCase);
+        private readonly IDictionary<string, int> _nameIndex;
         private readonly List<T> _values = new List<T>();
+
+        public IndexedNameValueCollection() : this(false)
+        {
+        }
+
+        /// <param name="concurrentReads">
+        /// Искать по имени можно из других потоков, пока в коллекцию добавляют элементы:
+        /// значение добавляется раньше имени, а индекс имен потокобезопасный.
+        /// Добавлять элементы по-прежнему нужно из одного потока за раз.
+        /// </param>
+        public IndexedNameValueCollection(bool concurrentReads)
+        {
+            _nameIndex = concurrentReads
+                ? new ConcurrentDictionary<string, int>(StringComparer.InvariantCultureIgnoreCase)
+                : new Dictionary<string, int>(StringComparer.InvariantCultureIgnoreCase);
+        }
 
         public int Add(T item, string name)
         {
