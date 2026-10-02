@@ -6,6 +6,7 @@ at http://mozilla.org/MPL/2.0/.
 ----------------------------------------------------------*/
 
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using OneScript.Contexts;
@@ -18,8 +19,12 @@ namespace ScriptEngine.Machine
 {
     public class DefaultTypeManager : ITypeManager
     {
-        private readonly Dictionary<string, int> _knownTypesIndexes = new Dictionary<string, int>(StringComparer.InvariantCultureIgnoreCase);
-        private readonly List<TypeDescriptor> _knownTypes = new List<TypeDescriptor>();
+        // Типы регистрируются и из фоновых заданий (ПодключитьСценарий, внешние компоненты).
+        // Регистрация идет под блокировкой, чтение — без нее: словарь конкурентный,
+        // а список типов при регистрации заменяется новым массивом.
+        private readonly object _registrationLock = new object();
+        private readonly ConcurrentDictionary<string, TypeDescriptor> _knownTypesByName = new ConcurrentDictionary<string, TypeDescriptor>(StringComparer.InvariantCultureIgnoreCase);
+        private volatile TypeDescriptor[] _knownTypes = Array.Empty<TypeDescriptor>();
         private readonly TypeFactoryCache _factoryCache = new TypeFactoryCache();
         private readonly ILazyTypeResolver[] _resolvers;
 
@@ -42,9 +47,9 @@ namespace ScriptEngine.Machine
 
         public TypeDescriptor GetTypeByName(string name)
         {
-            if (_knownTypesIndexes.TryGetValue(name, out var index))
+            if (_knownTypesByName.TryGetValue(name, out var knownType))
             {
-                return _knownTypes[index];
+                return knownType;
             }
 
             if (TryResolveLazily(name, out var resolvedType))
@@ -70,9 +75,8 @@ namespace ScriptEngine.Machine
         
         public bool TryGetType(string name, out TypeDescriptor type)
         {
-            if (_knownTypesIndexes.TryGetValue(name, out var index))
+            if (_knownTypesByName.TryGetValue(name, out type))
             {
-                type = _knownTypes[index];
                 return true;
             }
 
@@ -87,37 +91,38 @@ namespace ScriptEngine.Machine
 
         public TypeDescriptor RegisterType(string name, string alias, Type implementingClass)
         {
-            if (_knownTypesIndexes.ContainsKey(name))
+            lock (_registrationLock)
             {
-                var td = GetTypeByName(name);
-                if (td.ImplementingClass != implementingClass)
+                if (_knownTypesByName.TryGetValue(name, out var td))
                 {
-                    throw new InvalidOperationException($"Name `{name}` is already registered");
+                    if (td.ImplementingClass != implementingClass)
+                    {
+                        throw new InvalidOperationException($"Name `{name}` is already registered");
+                    }
+
+                    return td;
                 }
 
-                return td;
-            }
-            else
-            {
                 var typeDesc = new TypeDescriptor(implementingClass, name, alias);
                 RegisterTypeInternal(typeDesc);
                 return typeDesc;
             }
-
         }
         
         public void RegisterType(TypeDescriptor typeDescriptor)
         {
-            if (_knownTypesIndexes.TryGetValue(typeDescriptor.Name, out var index))
+            lock (_registrationLock)
             {
-                var knownType = _knownTypes[index];
-                if (knownType != typeDescriptor)
-                    throw new InvalidOperationException($"Type {typeDescriptor} already registered");
-                
-                return;
+                if (_knownTypesByName.TryGetValue(typeDescriptor.Name, out var knownType))
+                {
+                    if (knownType != typeDescriptor)
+                        throw new InvalidOperationException($"Type {typeDescriptor} already registered");
+
+                    return;
+                }
+
+                RegisterTypeInternal(typeDescriptor);
             }
-            
-            RegisterTypeInternal(typeDescriptor);
         }
 
         public ITypeFactory GetFactoryFor(TypeDescriptor type)
@@ -127,12 +132,16 @@ namespace ScriptEngine.Machine
 
         private void RegisterTypeInternal(TypeDescriptor td)
         {
-            var nextListId = _knownTypes.Count;
-            _knownTypesIndexes.Add(td.Name, nextListId);
+            // Сначала список: тип, найденный по имени, уже есть и в нем
+            var knownTypes = _knownTypes;
+            var newKnownTypes = new TypeDescriptor[knownTypes.Length + 1];
+            knownTypes.CopyTo(newKnownTypes, 0);
+            newKnownTypes[knownTypes.Length] = td;
+            _knownTypes = newKnownTypes;
+
+            _knownTypesByName[td.Name] = td;
             if (!string.IsNullOrWhiteSpace(td.Alias) && td.Alias != td.Name)
-                _knownTypesIndexes[td.Alias] = nextListId;
-            
-            _knownTypes.Add(td);
+                _knownTypesByName[td.Alias] = td;
         }
 
         private bool TryResolveLazily(string name, out TypeDescriptor type)
