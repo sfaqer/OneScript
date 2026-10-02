@@ -126,6 +126,13 @@ namespace ScriptEngine.HostedScript
         public void HandleEvent(IRuntimeContextInstance eventSource, string eventName, IValue[] eventArgs,
             IBslProcess process)
         {
+            HandleEvent(eventSource, eventName, eventArgs, process, null);
+        }
+
+        // Без onHandlerError исключение обработчика прерывает следующие и уходит вызывающему
+        public void HandleEvent(IRuntimeContextInstance eventSource, string eventName, IValue[] eventArgs,
+            IBslProcess process, Action<Exception> onHandlerError)
+        {
             Handler[] handlersLocalCopy;
 
             lock (_subscriptionLock)
@@ -146,7 +153,14 @@ namespace ScriptEngine.HostedScript
 
             foreach (var handler in handlersLocalCopy)
             {
-                handler.Method(process, eventArgs);
+                try
+                {
+                    handler.Method(process, eventArgs);
+                }
+                catch (Exception exception) when (onHandlerError != null)
+                {
+                    onHandlerError(exception);
+                }
             }
         }
     }
