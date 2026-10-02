@@ -181,7 +181,7 @@ namespace OneScript.StandardLibrary.Text
             }
             set 
             {
-                Console.OutputEncoding = TextEncodingEnum.GetEncoding(value);                
+                ConsoleWriterRouter.SetOutputEncoding(TextEncodingEnum.GetEncoding(value));
             }
         }
 
@@ -229,34 +229,61 @@ namespace OneScript.StandardLibrary.Text
         }
 
         /// <summary>
-        /// Глобально переопределяет стандартный вывод и направляет в другой поток
+        /// Переопределяет стандартный вывод и направляет в другой поток.
+        /// Действует в текущем потоке выполнения и в фоновых заданиях, запущенных из него после вызова.
         /// </summary>
-        /// <param name="target">Поток назначения</param>
+        /// <param name="target">Поток назначения. Неопределено - вернуть стандартный вывод</param>
         [ContextMethod("УстановитьПотокВывода", "SetOutput")]
         public void SetOutput(IValue target)
         {
-            if (!(target.AsObject() is IStreamWrapper stream))
-                throw RuntimeException.InvalidArgumentType(nameof(target));
-            
-            var writer = new StreamWriter(stream.GetUnderlyingStream(), Console.OutputEncoding)
-            {
-                AutoFlush = true,
-            };
-            Console.SetOut(writer);
+            ConsoleWriterRouter.SetOut(CreateWriter(target), target.GetRawValue());
         }
-        
+
         /// <summary>
-        /// Глобально переопределяет стандартный поток ошибок и направляет в другой поток
+        /// Возвращает поток, в который перенаправлен стандартный вывод текущего потока выполнения,
+        /// в том числе унаследованный фоновым заданием от запустившего его кода.
         /// </summary>
-        /// <param name="target">Поток назначения</param>
+        /// <returns>Поток, Неопределено - вывод не перенаправлен</returns>
+        [ContextMethod("ПолучитьПотокВывода", "GetOutput")]
+        public IValue GetOutput()
+        {
+            return ConsoleWriterRouter.GetOutSource() ?? BslUndefinedValue.Instance;
+        }
+
+        /// <summary>
+        /// Переопределяет стандартный поток ошибок и направляет в другой поток.
+        /// Действует в текущем потоке выполнения и в фоновых заданиях, запущенных из него после вызова.
+        /// </summary>
+        /// <param name="target">Поток назначения. Неопределено - вернуть стандартный поток ошибок</param>
         [ContextMethod("УстановитьПотокОшибок", "SetError")]
         public void SetError(IValue target)
         {
+            ConsoleWriterRouter.SetError(CreateWriter(target), target.GetRawValue());
+        }
+
+        /// <summary>
+        /// Возвращает поток, в который перенаправлен поток ошибок текущего потока выполнения,
+        /// в том числе унаследованный фоновым заданием от запустившего его кода.
+        /// </summary>
+        /// <returns>Поток, Неопределено - поток ошибок не перенаправлен</returns>
+        [ContextMethod("ПолучитьПотокОшибок", "GetError")]
+        public IValue GetError()
+        {
+            return ConsoleWriterRouter.GetErrorSource() ?? BslUndefinedValue.Instance;
+        }
+
+        private static StreamWriter CreateWriter(IValue target)
+        {
+            if (target.GetRawValue() is BslUndefinedValue)
+                return null;
+
             if (!(target.AsObject() is IStreamWrapper stream))
                 throw RuntimeException.InvalidArgumentType(nameof(target));
-            
-            var writer = new StreamWriter(stream.GetUnderlyingStream());
-            Console.SetError(writer);
+
+            return new StreamWriter(stream.GetUnderlyingStream(), Console.OutputEncoding)
+            {
+                AutoFlush = true,
+            };
         }
 
         public const string ConsoleCancelKeyEvent = "CancelKeyPressed";
